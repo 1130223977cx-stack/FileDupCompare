@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "文件比对工具"
-APP_VER = "1.3.0"
+APP_VER = "1.3.1"
 
 # ---------------- 视觉（卡片仪表盘风格）----------------
 C_PAPER = "#F2F4F8"
@@ -454,6 +454,16 @@ def human_size(n: int) -> str:
     if n >= 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n} B"
+
+
+def _under(path: str, root: str) -> bool:
+    """path 是否位于 root 之下（大小写不敏感，兼容长路径前缀）。"""
+    try:
+        a = os.path.normcase(os.path.abspath(win_path(path)))
+        b = os.path.normcase(os.path.abspath(win_path(root)))
+    except Exception:
+        return False
+    return a == b or a.startswith(b.rstrip("\\") + "\\")
 
 
 def _safe_size(p: str) -> int:
@@ -2344,6 +2354,9 @@ class MainWindow(QWidget):
         act_ba = menu.addAction("B 侧独有内容 → 并入 A")
         act_ab.triggered.connect(lambda: self._open_merge("A"))
         act_ba.triggered.connect(lambda: self._open_merge("B"))
+        menu.addSeparator()
+        act_undo = menu.addAction("撤销上次归并（按操作日志搬回）")
+        act_undo.triggered.connect(self._undo_last_merge)
         self.btn_merge.setMenu(menu)
         self.btn_merge.setToolTip("把一侧独有的内容各搬一份到另一侧，使该侧剩余文件全部可在另一侧找到")
         tl.addWidget(self.btn_merge)
@@ -3089,7 +3102,77 @@ class MainWindow(QWidget):
         self._render()
         self.st_scan.setText(f"已撤销 {back} 个文件的移动")
 
+    def _merge_log_batch(self) -> list[tuple[str, str, str]]:
+        """从当天的操作日志里取出「最近一批成功的归并移动」：[(源, 目标, 侧)]。"""
+        path = os.path.join(self.app_dir(), "logs", f"操作日志_{datetime.now():%Y-%m-%d}.csv")
+        if not os.path.exists(path):
+            return []
+        rows = []
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                for r in csv.reader(f):
+                    rows.append(r)
+        except Exception:
+            return []
+        out = []
+        for r in reversed(rows[1:]):
+            if len(r) >= 9 and r[1] == "归并移动" and r[7] == "成功":
+                out.append((r[3], r[4], r[2]))
+            else:
+                break
+        return list(reversed(out))
+
+    def _undo_last_merge(self):
+        moves = self._merge_log_batch()
+        if not moves:
+            QMessageBox.information(self, APP_NAME, "当天操作日志里没有可撤销的归并记录。")
+            return
+        entries = [("A/B", f"{dst}  →  {src}") for src, dst, _sd in moves]
+        note = ("按当天操作日志反向搬回：把上次归并搬走的文件从目标位置搬回原位置。\n"
+                "只处理「目标存在且原位空缺」的条目；原位已有同名文件的不动，逐条记日志。")
+        if ListDialog("撤销上次归并 · 预览", f"{len(moves)} 个文件 · 反向搬回", entries, note,
+                      "确认撤销", parent=self).exec() != QDialog.Accepted:
+            return
+        back, logs, skipped = 0, [], []
+        for src, dst, sd in moves:
+            try:
+                if not os.path.exists(win_path(dst)):
+                    skipped.append((dst, "目标已不存在"))
+                    continue
+                if os.path.exists(win_path(src)):
+                    skipped.append((src, "原位已有同名文件"))
+                    continue
+                os.makedirs(win_path(os.path.dirname(src)), exist_ok=True)
+                shutil.move(win_path(dst), win_path(src))
+                back += 1
+                logs.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "撤销归并", sd,
+                             dst, src, "", "", "成功", ""])
+            except Exception as e:
+                skipped.append((src, str(e)))
+                logs.append([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "撤销归并", sd,
+                             dst, src, "", "", "失败", str(e)])
+        self._write_log(logs)
+        self.log("OK" if back else "WARN", f"撤销上次归并：{back}/{len(moves)} 个文件已搬回原位")
+        for pth, why in skipped[:8]:
+            self.log("WARN", f"未撤销 {pth}：{why}")
+        self.st_scan.setText(f"已撤销 {back} 个文件的归并移动")
+
     # ---------- 归并 ----------
+    def _skipped_index(self, root: str) -> dict:
+        """目标侧被跳过文件：(小写文件名, 大小) -> 路径。用于判断「目标侧其实已经有这份内容」。"""
+        idx: dict[tuple[str, int], str] = {}
+        if not self.result:
+            return idx
+        for sp, _why in self.result.skipped:
+            if not _under(sp, root):
+                continue
+            try:
+                sz = os.path.getsize(win_path(sp))
+            except OSError:
+                continue
+            idx.setdefault((os.path.basename(sp).lower(), sz), sp)
+        return idx
+
     def _merge_candidates(self, side: str) -> list[tuple[Group, FileRec]]:
         """该侧内容在另一侧缺失的，按哈希各取一份代表搬过去。"""
         if not self.result:
@@ -3118,8 +3201,19 @@ class MainWindow(QWidget):
         dest_root = self.root_b if side == "A" else self.root_a
         dest = "B" if side == "A" else "A"
         src_root = self.root_a if side == "A" else self.root_b
-        entries, plans = [], []
+
+        # 目标侧被跳过文件的「同名 + 同尺寸」索引。
+        # 跳过 = 没算出哈希、没进比对结果，但它物理存在；若直接当「另一侧缺失」，
+        # 就会把同一份内容再搬一份过去，路径还多套一层（历史上踩过这个坑）。
+        seen = self._skipped_index(dest_root)
+
+        entries, plans, suspected = [], [], []
         for g, rec in cands:
+            key = (rec.name.lower(), rec.size)
+            if key in seen:
+                suspected.append((rec, seen[key]))
+                entries.append((side, f"〔不搬〕{rec.path} —— 目标侧已有同名同尺寸：{seen[key]}"))
+                continue
             try:
                 rel = os.path.relpath(rec.path, src_root)
             except ValueError:
@@ -3136,9 +3230,20 @@ class MainWindow(QWidget):
             entries.append((side, f"{rec.path}  →  {target}"))
 
         total = sum(r.size for r, _ in plans)
-        note = ("目标路径 = 另一侧根目录 + 源文件相对路径，目录结构不变；目标已有同名文件一律不覆盖，自动加 (1)(2) 序号。\n"
-                "归并只搬「另一侧缺失的内容」，同侧多份重复只搬一份；跳过项不参与。完成后会重算该侧是否还有独有内容。")
-        if ListDialog(f"归并预览 · {side} → {dest}", f"{len(plans)} 个文件 · {human_size(total)} · 不覆盖", entries, note, "确认剪切", parent=self).exec() != QDialog.Accepted:
+        note = (f"方向：从 {side} 侧（{src_root}）剪切到 {dest} 侧（{dest_root}）。\n"
+                "目标路径 = 目标根目录 + 源文件相对路径；目标已有同名文件一律不覆盖，自动加 (1)(2) 序号。\n"
+                "归并只搬「另一侧内容缺失」的文件；同侧多份重复只搬一份。")
+        if suspected:
+            note += (f"\n另有 {len(suspected)} 个文件未列入搬运：目标侧已存在同名同尺寸文件"
+                     "（多数是扫描时被跳过、没算进结果），为避免重复搬运与目录套层，默认不动它们。")
+        if not plans:
+            QMessageBox.information(self, APP_NAME,
+                                    f"{side} 侧独有内容里，没有需要搬运的文件："
+                                    f"{len(suspected)} 个在 {dest} 侧已有同名同尺寸副本。")
+            return
+        if ListDialog(f"归并预览 · {side} → {dest}",
+                      f"{len(plans)} 个文件 · {human_size(total)} · 从 {src_root} 到 {dest_root} · 不覆盖",
+                      entries, note, f"确认剪切到 {dest}", parent=self).exec() != QDialog.Accepted:
             return
 
         # 后台线程执行，界面不冻结；每条都写日志，可随时点「取消」
@@ -3191,10 +3296,10 @@ class MainWindow(QWidget):
 
             remain = self._merge_candidates(side)
             after = self.result.count_a if side == "A" else self.result.count_b
-            title = "归并完成" if ok and not remain else "归并完成（仍有残留）"
+            title = f"归并完成 · {side} → {dest}" if ok and not remain else f"归并完成 · {side} → {dest}（仍有残留）"
             if res.get("cancelled"):
-                title = f"归并已取消（已剪切 {ok} 个）"
-            html = (f"已剪切 <b>{ok}</b> 个文件到 {dest} 侧"
+                title = f"归并已取消 · {side} → {dest}（已剪切 {ok} 个）"
+            html = (f"已把 <b>{ok}</b> 个文件从 <b>{side}</b>（{src_root}）剪切到 <b>{dest}</b>（{dest_root}）"
                     + (f"，失败 {len(fail)} 个" if fail else "")
                     + ("，其余按原样保留在源侧。" if res.get("cancelled") else "") + "。<br><br>")
             if remain:
