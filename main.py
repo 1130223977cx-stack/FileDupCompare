@@ -3102,33 +3102,51 @@ class MainWindow(QWidget):
         self._render()
         self.st_scan.setText(f"已撤销 {back} 个文件的移动")
 
-    def _merge_log_batch(self) -> list[tuple[str, str, str]]:
-        """从当天的操作日志里取出「最近一批成功的归并移动」：[(源, 目标, 侧)]。"""
-        path = os.path.join(self.app_dir(), "logs", f"操作日志_{datetime.now():%Y-%m-%d}.csv")
-        if not os.path.exists(path):
-            return []
-        rows = []
+    def _merge_log_batch(self) -> tuple[list[tuple[str, str, str]], str]:
+        """从操作日志里取出「最近一批成功的归并移动」：([(源, 目标, 侧)], 日志文件名)。
+
+        先看当天的日志，没有归并记录就往前找最近一份有记录的操作日志——归并可能发生在
+        昨天甚至更早，重启、换天之后仍然要能撤销。
+        """
+        d = os.path.join(self.app_dir(), "logs")
         try:
-            with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                for r in csv.reader(f):
-                    rows.append(r)
-        except Exception:
-            return []
-        out = []
-        for r in reversed(rows[1:]):
-            if len(r) >= 9 and r[1] == "归并移动" and r[7] == "成功":
-                out.append((r[3], r[4], r[2]))
-            else:
-                break
-        return list(reversed(out))
+            names = sorted([n for n in os.listdir(d) if n.startswith("操作日志_") and n.endswith(".csv")],
+                           reverse=True)
+        except OSError:
+            return [], ""
+        today = f"操作日志_{datetime.now():%Y-%m-%d}.csv"
+        if today in names:  # 当天优先
+            names.remove(today)
+            names.insert(0, today)
+        for name in names:
+            path = os.path.join(d, name)
+            rows = []
+            try:
+                with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                    for r in csv.reader(f):
+                        rows.append(r)
+            except Exception:
+                continue
+            last_run, cur = [], []
+            for r in rows[1:]:
+                if len(r) >= 9 and r[1] == "归并移动" and r[7] == "成功":
+                    cur.append((r[3], r[4], r[2]))
+                else:
+                    if cur:
+                        last_run, cur = cur, []
+            if cur:
+                last_run = cur
+            if last_run:
+                return last_run, name
+        return [], ""
 
     def _undo_last_merge(self):
-        moves = self._merge_log_batch()
+        moves, src_log = self._merge_log_batch()
         if not moves:
-            QMessageBox.information(self, APP_NAME, "当天操作日志里没有可撤销的归并记录。")
+            QMessageBox.information(self, APP_NAME, "操作日志里没有可撤销的归并记录。")
             return
-        entries = [("A/B", f"{dst}  →  {src}") for src, dst, _sd in moves]
-        note = ("按当天操作日志反向搬回：把上次归并搬走的文件从目标位置搬回原位置。\n"
+        entries = [(sd, f"{dst}  →  {src}") for src, dst, sd in moves]
+        note = (f"依据 logs\\{src_log} 反向搬回：把上次归并搬走的文件从目标位置搬回原位置。\n"
                 "只处理「目标存在且原位空缺」的条目；原位已有同名文件的不动，逐条记日志。")
         if ListDialog("撤销上次归并 · 预览", f"{len(moves)} 个文件 · 反向搬回", entries, note,
                       "确认撤销", parent=self).exec() != QDialog.Accepted:
