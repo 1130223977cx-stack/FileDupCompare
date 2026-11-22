@@ -41,7 +41,7 @@
 
 ### 方式一：直接用打包好的 exe（推荐）
 
-1. 到 Releases 下载 `文件比对工具_免安装版_v1.3.zip`
+1. 到 [Releases](https://github.com/1130223977cx-stack/FileDupCompare/releases/latest) 下载 `FileDupCompare_v1.3.0_portable_win64.zip`
 2. 解压到任意目录（U 盘也行），双击 `FileDupCompare\FileDupCompare.exe`
 3. 删除目录即卸载
 
